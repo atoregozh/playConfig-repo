@@ -1,133 +1,75 @@
-package com.amazon.audhpownershipcacheremoverlambda;
+package com.amazon.audhpownershipcacheremoverlambda.activity;
 
-import java.io.IOException;
-import java.util.Objects;
-import java.util.Set;
+import static com.amazon.audhpownershipcacheremoverlambda.utils.Constants.SERVICE_NAME;
 
 import javax.inject.Inject;
 import javax.xml.bind.ValidationException;
 
-import com.amazon.alexacomplianceeventmanagementservice.DeleteEventStatus;
-import com.amazon.audhpownershipcacheremoverlambda.exception.AudHPOwnershipCacheRemoverException;
-import com.amazon.audhpownershipcacheremoverlambda.model.ComplianceNotification;
-import com.amazon.audhpownershipcacheremoverlambda.model.compliance.internal.AccountType;
-import com.amazon.audhpownershipcacheremoverlambda.model.compliance.internal.AdditionalMetadata;
-import com.amazon.audhpownershipcacheremoverlambda.model.compliance.internal.DataType;
-import com.amazon.audhpownershipcacheremoverlambda.model.compliance.internal.NotificationObligation;
-import com.amazon.audhpownershipcacheremoverlambda.model.compliance.internal.NotificationType;
+import com.amazon.audhpownershipcacheremoverlambda.ACEMSCallback;
+import com.amazon.audhpownershipcacheremoverlambda.DigitalAssetOwnershipCache;
+import com.amazon.audhpownershipcacheremoverlambda.ParseSnsMessage;
 import com.amazonaws.services.lambda.runtime.events.SNSEvent;
-import com.amazonaws.services.lambda.runtime.events.SQSEvent;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
+import lombok.AllArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
 @Log4j2
+@AllArgsConstructor
 public class OwnershipCacheProcessor {
 
-    private final OwnershipCacheStorageManager ownershipCacheStorageManager;
-    private final ACEMSCallback acemsCallback;
-    private final ObjectMapper objectMapper;
+    ParseSnsMessage parseSnsMessage;
+    final DigitalAssetOwnershipCache digitalAssetOwnershipCache;
+    final ACEMSCallback acemsCallback;
+
 
     @Inject
-    public OwnershipCacheProcessor(OwnershipCacheStorageManager ownershipCacheStorageManager,
-                                   ACEMSCallback acemsCallback,
-                                   ObjectMapper objectMapper) {
-        this.ownershipCacheStorageManager = ownershipCacheStorageManager;
+    public OwnershipCacheProcessor(final DigitalAssetOwnershipCache digitalAssetOwnershipCache,
+                                   final ACEMSCallback acemsCallback) {
+        this.parseSnsMessage = new ParseSnsMessage();
+        this.digitalAssetOwnershipCache = digitalAssetOwnershipCache;
         this.acemsCallback = acemsCallback;
-        this.objectMapper = objectMapper;
     }
 
-    public Void processSNS(SNSEvent snsEvent) throws AudHPOwnershipCacheRemoverException, ValidationException {
-
-        String customerId = SnsMessageParser.parseCustomerId(snsEvent);
-        ownershipCacheStorageManager.deleteFromCache(customerId);
-
-        return null;
-    }
-
-    public Void processSQS(SQSEvent sqsEvent) {
-        sqsEvent.getRecords()
-            .stream()
-            .map(SQSEvent.SQSMessage::getBody)
-            .map(this::parseSqsMessageBody)
-            .filter(Objects::nonNull)
-            .forEach(this::processRequest);
-
-        return null;
-    }
-
-    private ComplianceNotification parseSqsMessageBody(String sqsMessageBody) {
+    /**
+     * process message for deletion
+     * @param snsEvent event
+     * @return Void
+     */
+    public Void process(SNSEvent snsEvent) throws Exception{
         try {
-            return objectMapper.readValue(sqsMessageBody, ComplianceNotification.class);
-        } catch (IOException e) {
-            throw new RuntimeException("Failure during processing of sqsMessageBody", e);
+            String customerId = this.parseSnsMessage.parseCustomerId(snsEvent);
+            digitalAssetOwnershipCache.deleteFromCache(customerId);
+
+            // TODO: calls to ACEMS will depend on messages
+            reportDeleteStatus("DONE");
+        } catch (ValidationException e) {
+            throw new ValidationException(e);
+        } catch (Exception ex) {
+            log.error(ex);
+            reportDeleteStatus("NOT_DONE");
+        }
+        return null;
+    }
+
+
+    /**
+     * Once a message is processed successfully, report the deletion
+     * status to the AlexaComplianceEventManagementService
+     *
+     * delete status of DONE => all data purged from our system
+     * delete status of NOT_DONE => encountered issue and data is not purged
+     *
+     * @param notification // TODO: added the notification message as a param
+     * @param deleteStatus
+     * @return deletion status true/false
+     */
+    private void reportDeleteStatus(final String deleteStatus) {
+        try {
+            acemsCallback.reportDeleteStatus("123831", "DELETE",
+                                             SERVICE_NAME, deleteStatus);
+        } catch (Exception e) {
+            log.error("Failed to report deletion status", e);
         }
     }
 
-    /**
-     * see https://w.amazon.com/bin/view/WfV/Services/AudHpOwnershipCacheRemoverLambda/ for intuition behind this logic
-     */
-    private void processRequest(ComplianceNotification notification) {
-        log.info("Handling delete notification with notificationId={}, notificationType={}", notification.getNotificationId(),
-                 notification.getNotificationType());
-
-        NotificationType notificationType = notification.getNotificationType();
-        switch (notificationType) {
-            case HEARTBEAT:
-                reportDeleteStatus(notification, DeleteEventStatus.DONE);
-                break;
-            case DELETE:
-                if (isChildDataDeletionRequestedByParent(notification) || !isChildRequest(notification)) {
-                    reportDeleteStatus(notification, DeleteEventStatus.DONE);
-                    break;
-                }
-                try {
-                    ownershipCacheStorageManager.deleteFromCache(notification.getAccountIdentifier());
-                    reportDeleteStatus(notification, DeleteEventStatus.DONE);
-                } catch (Exception e) {
-                    log.error("Failed to delete notification with notificationId={} from ownership cache", notification.getNotificationId(), e);
-                    reportDeleteStatus(notification, DeleteEventStatus.NOT_DONE);
-                }
-                break;
-            case PORTABILITY:
-            case UNKNOWN:
-            default:
-                log.error("Non supported notification. notificationId={}, customerId={}, notificationType={}",
-                          notification.getNotificationId(), notification.getAccountIdentifier(), notification.getNotificationType());
-        }
-
-    }
-
-
-    /**
-     * https://w.amazon.com/bin/view/Alexa/Privacy/AlexaPrivacyComplianceFAQ/#HWhatdoesitmeantohavedifferentAccountTypes3F
-     */
-    private boolean isChildRequest(ComplianceNotification notification) {
-        return notification.getAdditionalMetadata()
-            .flatMap(AdditionalMetadata::getAccountType)
-            .filter(accountType -> accountType == AccountType.CHILD)
-            .isPresent();
-    }
-
-    /**
-     * per wiki, for COPPA case the only datatype included in partial deletion notifications is the CHILD_DIRECTED datatype
-     * https://w.amazon.com/bin/view/Alexa/Privacy/Deletion_Orchestrator/Contract/#H2.COPPA-Deleteallandterminatecustomer2026forchildcustomerandDeletepartialandleavecustomer202628deleteonlychild-directeddata29forparentcustomer
-     **/
-    private boolean isChildDataDeletionRequestedByParent(ComplianceNotification notification) {
-        boolean isPartialDeletion = notification.getNotificationObligation()
-            .map(obligation -> obligation == NotificationObligation.DELETE_PARTIAL_AND_LEAVE_CUSTOMER_ACCOUNT_ACTIVE)
-            .orElse(false);
-
-        Set<DataType> eligibleDataTypes = notification.getEligibleDatatypes();
-
-        return isPartialDeletion
-            && eligibleDataTypes.size() == 1
-            && eligibleDataTypes.contains(DataType.CHILD_DIRECTED);
-    }
-
-    private void reportDeleteStatus(ComplianceNotification notification, String deleteStatus) {
-        log.info("Reporting delete status to ACEMS for notificationId={}, notificationType={}",
-                 notification.getNotificationId(), notification.getNotificationType());
-        acemsCallback.reportDeleteStatus(notification, deleteStatus);
-    }
 }
